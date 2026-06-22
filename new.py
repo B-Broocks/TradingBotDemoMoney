@@ -147,14 +147,37 @@ def get_active_portfolio_snapshot():
     return None # Returns None if API crashes (Triggers Fail-Safe)
 
 def get_live_price(ticker):
+    """Fetches live price with a fallback for missing Yahoo data."""
     yf_ticker = f"{ticker}.DE" if ticker in STOCKS_EU else ticker
-    try: return float(yf.Ticker(yf_ticker).history(period="1d", interval="1m")['Close'].iloc[-1])
-    except: return None
+    try: 
+        # Using 5d avoids the "No data found" error if 1d is temporarily empty
+        hist = yf.Ticker(yf_ticker).history(period="5d", interval="1m")
+        if not hist.empty:
+            return float(hist['Close'].iloc[-1])
+            
+        # Fallback if the .DE suffix is causing issues
+        if ticker in STOCKS_EU:
+            hist_fallback = yf.Ticker(ticker).history(period="5d", interval="1m")
+            if not hist_fallback.empty:
+                return float(hist_fallback['Close'].iloc[-1])
+    except: pass
+    return None
 
 def get_daily_high(ticker):
+    """Fetches daily high with a fallback for missing Yahoo data."""
     yf_ticker = f"{ticker}.DE" if ticker in STOCKS_EU else ticker
-    try: return float(yf.Ticker(yf_ticker).history(period="1d", interval="1m")['High'].max())
-    except: return None
+    try: 
+        hist = yf.Ticker(yf_ticker).history(period="5d", interval="1m")
+        if not hist.empty:
+            return float(hist['High'].max())
+            
+        # Fallback if the .DE suffix is causing issues
+        if ticker in STOCKS_EU:
+            hist_fallback = yf.Ticker(ticker).history(period="5d", interval="1m")
+            if not hist_fallback.empty:
+                return float(hist_fallback['High'].max())
+    except: pass
+    return None
 
 def run_scalping_bot():
     ticker_map = get_t212_ticker_map()
