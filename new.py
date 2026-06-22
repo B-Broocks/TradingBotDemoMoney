@@ -4,6 +4,8 @@ import requests
 import logging
 import time
 import math
+import json
+import os
 from datetime import datetime
 
 # configuration and logging
@@ -25,13 +27,14 @@ yf_session.headers.update({
 })
 
 # parameters
-MAX_OPEN_POSITIONS = 5        # Limit portfolio exposure to 5 concurrent trades
+MAX_OPEN_POSITIONS = 6        # Limit portfolio exposure to 6 concurrent trades
 RISK_PER_TRADE_PCT = 0.20     # Invest 20% of TOTAL equity per trade
 MIN_CASH_REQUIRED = 50.0      # Minimum free cash required to execute a trade
 EMERGENCY_STOP_PCT = 0.01     # -1.0% initial hard stop right after buying
 BREAK_EVEN_PROFIT = 0.005     # Activation threshold: Stock reaches +0.5% profit
 BREAK_EVEN_STOP = 0.001       # Move stop loss to +0.1% to guarantee a risk-free trade
 TRAIL_DISTANCE = 0.003        # Once in profit, trail the stop 0.3% behind the peak price
+STATE_FILE = "botMemory.json"
 
 # watchlists
 STOCKS_EU = ["SAP", "SIE", "MBG", "VOW3", "BMW", "ALV", "DTE", "BAYN", "BAS", "EON", "RWE"]
@@ -190,10 +193,32 @@ def get_daily_high(ticker):
     except: pass
     return None
 
+
+def load_state():
+    """Loads open positions, if they exist"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                saved_positions = json.load(f)
+                logging.info(f"💾 Memory loaded: {len(saved_positions)} positions found.")
+                return saved_positions
+        except Exception as e:
+            logging.error(f"Error at loading memory: {e}")
+    return {} # returns an empty dictionary, if none exists
+
+def save_state(positions):
+    """Saves current state of positions."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(positions, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error at saving memory: {e}")
+
 def run_scalping_bot():
     ticker_map = get_t212_ticker_map()
-    open_positions = {}
+    open_positions = load_state()
     print(f"=== BOT READY - WATCHING {len(ticker_map)} STOCKS (EU/US/JP) ===")
+    print(f"=== Current positions: {len(open_positions)} ===")
 
     while True:
         now_dt = datetime.now()
@@ -316,7 +341,8 @@ def run_scalping_bot():
                         
                         time.sleep(2) # Protect API from rapid requests
                         acc = get_account_data() # Update cash variables before next loop
-        
+        save_state(open_positions)
+
         time.sleep(60)
 
 if __name__ == "__main__":
