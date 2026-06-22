@@ -6,10 +6,10 @@ import time
 import math
 from datetime import datetime
 
-# --- CONFIGURATION & LOGGING ---
+# configuration and logging
 BASE_URL = "https://demo.trading212.com/api/v0"
 
-# Logs all actions to a file so we can trace bugs and analyze trade history later
+# Log all actions to a file to track bugs, executed trades, and stop-loss triggers
 logging.basicConfig(
     filename="trading_bot.log",
     level=logging.INFO,
@@ -17,23 +17,30 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# --- STRATEGY PARAMETERS ---
-MAX_OPEN_POSITIONS = 5        # Limit to exactly 5 concurrent trades
-RISK_PER_TRADE_PCT = 0.20     # Target: Invest 20% of TOTAL equity per trade
-MIN_CASH_REQUIRED = 50.0      # Absolute minimum cash needed to bother making a trade
-EMERGENCY_STOP_PCT = 0.01     # -1.0% Hard Stop right after buying
-BREAK_EVEN_PROFIT = 0.005     # When stock is +0.5% in profit...
-BREAK_EVEN_STOP = 0.001       # ...move stop loss to +0.1% (Lock in guaranteed profit)
-TRAIL_DISTANCE = 0.003        # Once in profit, trail 0.3% behind the highest price
+# Custom Session for Yahoo Finance
+# Spoofs a standard web browser to prevent Yahoo from blocking our server IP (HTTP 429/403)
+yf_session = requests.Session()
+yf_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+})
 
-# --- WATCHLISTS & REGIONS ---
+# parameters
+MAX_OPEN_POSITIONS = 5        # Limit portfolio exposure to 5 concurrent trades
+RISK_PER_TRADE_PCT = 0.20     # Invest 20% of TOTAL equity per trade
+MIN_CASH_REQUIRED = 50.0      # Minimum free cash required to execute a trade
+EMERGENCY_STOP_PCT = 0.01     # -1.0% initial hard stop right after buying
+BREAK_EVEN_PROFIT = 0.005     # Activation threshold: Stock reaches +0.5% profit
+BREAK_EVEN_STOP = 0.001       # Move stop loss to +0.1% to guarantee a risk-free trade
+TRAIL_DISTANCE = 0.003        # Once in profit, trail the stop 0.3% behind the peak price
+
+# watchlists
 STOCKS_EU = ["SAP", "SIE", "MBG", "VOW3", "BMW", "ALV", "DTE", "BAYN", "BAS", "EON", "RWE"]
 STOCKS_US = ["TSLA", "AAPL", "NVDA", "MSFT", "AMZN", "META", "GOOGL", "AMD", "NFLX"]
 STOCKS_JP = ["SONY", "TM", "HMC", "MUFG"] 
 
 WATCHLIST_TICKERS = STOCKS_EU + STOCKS_US + STOCKS_JP
 
-# Market hours in minutes (German Time)
+# Market hours translated to total daily minutes (Based on German Time)
 MARKET_HOURS = {
     "EU": {"open": 9 * 60, "close": 17 * 60 + 30},   
     "US": {"open": 15 * 60 + 30, "close": 22 * 60},  
@@ -41,20 +48,21 @@ MARKET_HOURS = {
 }
 
 def get_market_state(region, current_minutes, is_friday):
-    """Evaluates if we are allowed to trade, hold, or if we must panic-sell for the weekend."""
+    """Determines if a market is safe to trade, closed, or approaching the weekend."""
     open_time = MARKET_HOURS[region]["open"]
     close_time = MARKET_HOURS[region]["close"]
     
     if current_minutes < open_time or current_minutes >= close_time: 
         return "CLOSED"
     if current_minutes < (open_time + 2): 
-        return "WAIT_FOR_OPEN" # Avoid high spreads at the opening bell
+        return "WAIT_FOR_OPEN" # Skip the first 2 minutes due to extreme volatility/spreads
     if is_friday and current_minutes >= (close_time - 10): 
-        return "FRIDAY_CLOSING" # Weekend risk mitigation
+        return "FRIDAY_CLOSING" # Flag for weekend liquidation to avoid Monday gaps
         
     return "TRADING"
 
 def get_region_for_ticker(ticker):
+    """Maps a stock symbol to its geographical region for market hour checks."""
     if ticker in STOCKS_EU: return "EU"
     if ticker in STOCKS_US: return "US"
     if ticker in STOCKS_JP: return "JP"
@@ -62,8 +70,8 @@ def get_region_for_ticker(ticker):
 
 def get_t212_ticker_map():
     """
-    STRICT MAPPING: Prevents buying Canadian "Saputo" instead of German "SAP".
-    Forces EU stocks to EU exchanges and US stocks to US exchanges.
+    Fetches the broker's internal database.
+    Strictly maps our short symbols to the correct exchange (e.g., prevents buying Canadian SAP instead of German SAP).
     """
     print("Mapping EU, US & JP tickers securely...")
     endpoint = f"{BASE_URL}/equity/metadata/instruments"
@@ -76,7 +84,7 @@ def get_t212_ticker_map():
         ticker_code = item.get("ticker", "")
         
         if short_name in WATCHLIST_TICKERS and item.get("type") == "STOCK":
-            # Strict assignment to prevent wrong exchanges
+            # Force EU stocks to Xetra/DE exchanges, and US/JP to US exchanges
             if short_name in STOCKS_EU and ("d_EQ" in ticker_code or "_DE_EQ" in ticker_code):
                 ticker_map[short_name] = ticker_code
             elif short_name in STOCKS_US and "_US_EQ" in ticker_code:
@@ -87,7 +95,7 @@ def get_t212_ticker_map():
     return ticker_map
 
 def get_account_data():
-    """Returns Total Equity (Value of all stocks + cash) AND Free uninvested Cash."""
+    """Fetches total portfolio value (for dynamic sizing) and available free cash."""
     endpoint = f"{BASE_URL}/equity/account/cash"
     try:
         response = requests.get(endpoint, auth=(API_KEY, SECRET_API_KEY))
@@ -100,7 +108,7 @@ def get_account_data():
     return {"total": 0.0, "free": 0.0}
 
 def cancel_all_stop_orders(t212_ticker):
-    """Deletes active stop-losses. MUST be done before selling to unlock the shares."""
+    """Removes active stop-losses. This must be done to unlock shares before selling them."""
     endpoint = f"{BASE_URL}/equity/orders"
     try:
         response = requests.get(endpoint, auth=(API_KEY, SECRET_API_KEY))
@@ -111,7 +119,7 @@ def cancel_all_stop_orders(t212_ticker):
     except: pass
 
 def execute_order(t212_ticker, quantity, action):
-    """Sends Market Orders. Sells require a negative quantity in T212 API."""
+    """Executes Market BUY/SELL orders. Trading212 requires negative quantities for selling."""
     if action == "SELL":
         cancel_all_stop_orders(t212_ticker) 
         api_qty = -quantity 
@@ -122,10 +130,10 @@ def execute_order(t212_ticker, quantity, action):
     return response.status_code == 200
 
 def place_server_stop_loss(t212_ticker, quantity, stop_price):
-    """Sets the physical hard-stop on the broker server."""
+    """Places a physical hard-stop on the broker's server to protect the account while offline."""
     payload = {
         "ticker": t212_ticker, 
-        "quantity": -quantity, # Requires negative qty
+        "quantity": -quantity, 
         "stopPrice": round(stop_price, 2)
     }
     response = requests.post(f"{BASE_URL}/equity/orders/stop", json=payload, auth=(API_KEY, SECRET_API_KEY))
@@ -136,46 +144,49 @@ def place_server_stop_loss(t212_ticker, quantity, stop_price):
 
 def get_active_portfolio_snapshot():
     """
-    RATE LIMIT PROTECTOR: Fetches all positions exactly ONCE per loop.
-    Returns a dictionary of {ticker: average_buy_price}.
+    Downloads active positions exactly once per loop to drastically reduce API calls.
+    Returns None if the API crashes, acting as a fail-safe to prevent accidental position deletion.
     """
     try:
         response = requests.get(f"{BASE_URL}/equity/portfolio", auth=(API_KEY, SECRET_API_KEY))
         if response.status_code == 200:
             return {pos.get("ticker"): float(pos.get("averagePrice")) for pos in response.json()}
     except: pass
-    return None # Returns None if API crashes (Triggers Fail-Safe)
+    return None 
 
 def get_live_price(ticker):
-    """Fetches live price with a fallback for missing Yahoo data."""
+    """Fetches real-time price using the spoofed session, with a 5-minute fallback if 1-minute data is missing."""
     yf_ticker = f"{ticker}.DE" if ticker in STOCKS_EU else ticker
     try: 
-        # Using 5d avoids the "No data found" error if 1d is temporarily empty
-        hist = yf.Ticker(yf_ticker).history(period="5d", interval="1m")
+        stock = yf.Ticker(yf_ticker, session=yf_session)
+        
+        hist = stock.history(period="1d", interval="1m")
         if not hist.empty:
             return float(hist['Close'].iloc[-1])
             
-        # Fallback if the .DE suffix is causing issues
-        if ticker in STOCKS_EU:
-            hist_fallback = yf.Ticker(ticker).history(period="5d", interval="1m")
-            if not hist_fallback.empty:
-                return float(hist_fallback['Close'].iloc[-1])
+        hist_5m = stock.history(period="5d", interval="5m")
+        if not hist_5m.empty:
+            return float(hist_5m['Close'].iloc[-1])
+            
     except: pass
     return None
 
 def get_daily_high(ticker):
-    """Fetches daily high with a fallback for missing Yahoo data."""
+    """Fetches the highest price of the current day to calculate drop setups."""
     yf_ticker = f"{ticker}.DE" if ticker in STOCKS_EU else ticker
     try: 
-        hist = yf.Ticker(yf_ticker).history(period="5d", interval="1m")
+        stock = yf.Ticker(yf_ticker, session=yf_session)
+        
+        hist = stock.history(period="1d", interval="1m")
         if not hist.empty:
             return float(hist['High'].max())
             
-        # Fallback if the .DE suffix is causing issues
-        if ticker in STOCKS_EU:
-            hist_fallback = yf.Ticker(ticker).history(period="5d", interval="1m")
-            if not hist_fallback.empty:
-                return float(hist_fallback['High'].max())
+        hist_5m = stock.history(period="5d", interval="5m")
+        if not hist_5m.empty:
+            latest_day = hist_5m.index[-1].date()
+            todays_data = hist_5m[hist_5m.index.date == latest_day]
+            if not todays_data.empty:
+                return float(todays_data['High'].max())
     except: pass
     return None
 
@@ -190,43 +201,44 @@ def run_scalping_bot():
         current_minutes = now_dt.hour * 60 + now_dt.minute
         is_friday = now_dt.weekday() == 4 
         
-        # 1. Fetch truth from server ONCE to save API limits
+        # Pull single source of truth from broker
         portfolio_snapshot = get_active_portfolio_snapshot()
         
-        # --- PHASE 1: MANAGE OPEN POSITIONS ---
+        # phase 1 manage open positions
         for name in list(open_positions.keys()):
             trade = open_positions[name]
             region = get_region_for_ticker(name)
             market_state = get_market_state(region, current_minutes, is_friday)
             
-            # Fail-Safe check: Did the server sell our stock?
+            # Fail-Safe check: If the API worked but our stock is gone, the broker's stop-loss was triggered
             if portfolio_snapshot is not None:
                 if trade["ticker"] not in portfolio_snapshot:
                     print(f"[{now}] ℹ️ Server Stop-Loss was triggered for {name}. Position closed.")
                     del open_positions[name]
                     continue
             
-            # Weekend Panic-Sell
+            # Friday Liquidation: Sell everything to avoid holding over the weekend
             if market_state == "FRIDAY_CLOSING":
                 print(f"[{now}] ⏰ WEEKEND RISK: Liquidating {name} before Friday close...")
                 if execute_order(trade["ticker"], trade["quantity"], "SELL"):
                     del open_positions[name]
                 continue
                 
+            # Do nothing overnight, the server stop-loss keeps us safe
             if market_state == "CLOSED":
-                continue # Do nothing overnight, let the server stop-loss protect us
+                continue 
                 
             price = get_live_price(name)
             if not price: continue
             
-            # Track peak price for trailing stops
+            # Track the highest achieved price for our trailing stop logic
             if price > trade["highest"]: 
                 trade["highest"] = price
             
             profit_pct = (price - trade["entry"]) / trade["entry"]
             target_stop = 0.0
             
-            # Break-Even & Trailing Logic
+            # Trailing Logic: Secure break-even if target reached, else maintain emergency stop
             if profit_pct >= BREAK_EVEN_PROFIT:
                 break_even_price = trade["entry"] * (1 + BREAK_EVEN_STOP)
                 trailing_price = trade["highest"] * (1 - TRAIL_DISTANCE)
@@ -234,7 +246,7 @@ def run_scalping_bot():
             else:
                 target_stop = trade["entry"] * (1 - EMERGENCY_STOP_PCT)
             
-            # Update Server only if needed (saves API calls)
+            # Send API update only if the new stop is meaningfully higher (prevents rate limit bans)
             if target_stop > trade["current_stop"] * 1.001:
                 print(f"[{now}] 📈 Updating Trailing Stop for {name} to {target_stop:.2f}")
                 cancel_all_stop_orders(trade["ticker"])
@@ -242,12 +254,12 @@ def run_scalping_bot():
                 if place_server_stop_loss(trade["ticker"], trade["quantity"], target_stop):
                     trade["current_stop"] = target_stop
 
-        # --- PHASE 2: SCAN MARKET FOR NEW DIPS ---
+        # phase 2 scan for new market dips
         acc = get_account_data()
         
         for name, t212_code in ticker_map.items():
             if len(open_positions) >= MAX_OPEN_POSITIONS:
-                break # Stop scanning if we hit our 5-position limit
+                break # Enforce portfolio limit
                 
             if name in open_positions: continue
             
@@ -257,21 +269,18 @@ def run_scalping_bot():
             if market_state != "TRADING":
                 continue
             
-            # Check price structure
             price = get_live_price(name)
             high = get_daily_high(name)
             if not price or not high: continue
             
-            # Trigger: Dropped 0.5% from daily high
+            # Buy Trigger: Price dropped 0.5% from today's peak
             if ((high - price) / high) >= 0.005:
                 
-                # --- DYNAMIC POSITION SIZING (20% or Rest) ---
+                # Dynamic Sizing: Use 20% of total portfolio, or go "All-In" with the rest
                 target_budget = acc["total"] * RISK_PER_TRADE_PCT
-                
-                # If we have less cash than 20%, go "All-In" with the remaining cash
                 budget = target_budget if acc["free"] >= target_budget else acc["free"]
                 
-                # Absolute minimum limit (Don't buy 1 share for 2 EUR)
+                # Minimum requirement guardrail
                 if budget < MIN_CASH_REQUIRED: 
                     continue
                 
@@ -283,9 +292,9 @@ def run_scalping_bot():
                     
                     if execute_order(t212_code, qty, "BUY"):
                         
-                        time.sleep(3) # Wait for T212 to settle the trade
+                        time.sleep(3) # Let the broker settle the trade into the portfolio
                         
-                        # Fetch the exact entry execution price to avoid spread issues
+                        # Fetch the exact entry execution price to avoid spread miscalculations
                         fresh_portfolio = get_active_portfolio_snapshot()
                         exact_entry = price 
                         
@@ -293,7 +302,7 @@ def run_scalping_bot():
                             exact_entry = fresh_portfolio[t212_code]
                             print(f"📊 Exact entry price confirmed for {name}: {exact_entry:.2f}")
 
-                        # Place initial physical -1% hard stop on the server based on EXACT entry
+                        # Set the initial physical hard-stop immediately after confirmation
                         stop_price = exact_entry * (1 - EMERGENCY_STOP_PCT)
                         place_server_stop_loss(t212_code, qty, stop_price)
                         
@@ -305,8 +314,8 @@ def run_scalping_bot():
                             "current_stop": stop_price
                         }
                         
-                        time.sleep(2) # Protect API 
-                        acc = get_account_data() # Update account balance for the next iteration
+                        time.sleep(2) # Protect API from rapid requests
+                        acc = get_account_data() # Update cash variables before next loop
         
         time.sleep(60)
 
